@@ -2,50 +2,56 @@
 Package gopool contains tools for goroutine reuse.
 
 */
+
 package gopool
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 )
 
-// WorkFunc is the type of function performed by workers.
-type WorkFunc func(ctx context.Context)
+// Job type executed on pool workers.
+type Job interface {
+	Start(ctx context.Context)
+}
 
 // Pool contains logic of goroutine reuse.
 type Pool struct {
-	workers    int
-	queue      int
-	sema       chan struct{}
-	work       chan WorkFunc
-	wg         sync.WaitGroup
-	cancel     chan struct{}
+	size int
+	sema chan struct{}
+	wg   sync.WaitGroup
+
+	queueSize int
+	queue     chan Job
+
 	ctx        context.Context
 	cancelFunc context.CancelFunc
-	mu         sync.RWMutex // guard closed
-	closed     bool
+
+	close   chan struct{}
+	mu      sync.Mutex // guard stopped
+	stopped bool
 }
 
 // New returns an initialized goroutine pool.
 //
-// The workers parameter determines the size of the pool.
-// The queue parameter determines the size of the work queue.
-func New(workers, queue int) (*Pool, error) {
-	if workers <= 0 {
+// The size parameter determines the size of the pool.
+// The queueSize parameter determines the size of the job queue.
+func New(size, queueSize int) (*Pool, error) {
+	if size <= 0 {
 		return nil, errors.New("size must be greater than 0")
 	}
 
-	if queue <= 0 {
-		return nil, errors.New("queue must be greater than 0")
+	if queueSize <= 0 {
+		return nil, errors.New("queue size must be greater than 0")
 	}
 
 	p := &Pool{
-		workers: workers,
-		queue:   queue,
+		size:      size,
+		queueSize: queueSize,
 	}
-
 	p.initialize()
 
 	return p, nil
@@ -53,82 +59,68 @@ func New(workers, queue int) (*Pool, error) {
 
 func (p *Pool) initialize() {
 	ctx, cancelFunc := context.WithCancel(context.Background())
+	p.sema = make(chan struct{}, p.size)
+	p.queue = make(chan Job, p.queueSize)
+	p.close = make(chan struct{})
 	p.ctx = ctx
 	p.cancelFunc = cancelFunc
-	p.sema = make(chan struct{}, p.workers)
-	p.work = make(chan WorkFunc, p.queue)
-	p.cancel = make(chan struct{})
-	p.closed = false
+	p.stopped = false
 }
 
-// Schedule schedules task to be executed over pool's workers.
-func (p *Pool) Schedule(work WorkFunc) error {
-	if p.IsClosed() {
-		return errors.New("pool closed")
+// Schedule schedules job to be executed over pool's workers.
+func (p *Pool) Schedule(job Job) error {
+	if p.IsStopped() {
+		return errors.New("pool stopped")
 	}
 
 	select {
-	case p.work <- work:
+	case p.queue <- job:
 		return nil
 	case p.sema <- struct{}{}:
-		p.worker(work)
+		p.worker(job)
 		return nil
 	}
 }
 
-// IsClosed returns if the pool is closed.
-func (p *Pool) IsClosed() bool {
+// IsStopped returns if the pool is stopped.
+func (p *Pool) IsStopped() bool {
 	select {
-	case <-p.cancel:
+	case <-p.close:
 		return true
 	default:
 		return false
 	}
 }
 
-// Close closes the pool.
-func (p *Pool) Close() {
+// Stop stops the workers.
+func (p *Pool) Stop() {
 	p.mu.Lock()
 
-	if !p.closed {
-		log.Println("[POOL] pool->Close()")
-		close(p.cancel)
-		p.cancelFunc()
-		p.closed = true
+	if !p.stopped {
+		log.Println("[POOL] pool->Stop()")
+		close(p.close) // signal to shutdown workers and close the pool.
+		p.cancelFunc() // tells an operation to abandon its work.
+		p.stopped = true
 
-		go func(p *Pool) {
+		go func() {
 			p.wg.Wait()
-			close(p.work)
-		}(p)
-	}
+			close(p.queue) // close the queue channel.
+		}()
 
-	for task := range p.work {
-		task(p.ctx)
+		for job := range p.queue {
+			job.Start(p.ctx)
+		}
 	}
 
 	p.mu.Unlock()
 }
 
-// Reset resets the closed pool.
-func (p *Pool) Reset() {
-	p.mu.Lock()
-	p.wg.Wait()
-
-	if !p.closed {
-		p.mu.Unlock()
-		return
-	}
-
-	p.initialize()
-	p.mu.Unlock()
-}
-
-func (p *Pool) worker(work WorkFunc) {
+func (p *Pool) worker(job Job) {
 	p.wg.Add(1)
 
-	go func(p *Pool) {
+	go func() {
 		defer func() {
-			log.Println("[POOL] worker done")
+			fmt.Println("[POOL] worker done")
 			<-p.sema
 			p.wg.Done()
 		}()
@@ -136,16 +128,16 @@ func (p *Pool) worker(work WorkFunc) {
 	loop:
 		for {
 			select {
-			case <-p.cancel:
+			case <-p.close:
 				return
-			case task, ok := <-p.work:
+			case job, ok := <-p.queue:
 				if !ok {
 					break loop
 				}
-				task(p.ctx)
+				job.Start(p.ctx)
 			}
 		}
-	}(p)
+	}()
 
-	p.work <- work
+	p.queue <- job
 }

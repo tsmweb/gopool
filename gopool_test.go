@@ -2,73 +2,63 @@ package gopool
 
 import (
 	"context"
+	"log"
 	"testing"
 	"time"
 )
 
-// go test -timeout 30s -v -run ^TestPool$
+// go test -v -run ^TestPool$
 func TestPool(t *testing.T) {
 	const workers = 10
-	const work = 1000
+	const jobSize = 1000
 
 	pool, err := New(workers, 1)
 	if err != nil {
 		t.Error(err.Error())
 	}
 
-	defer pool.Close()
+	defer pool.Stop()
 
-	newFunc := func(id int, d time.Duration) WorkFunc {
-		return func(context.Context) {
-			t.Log("[WORK] ID: ", id)
-			time.Sleep(d)
+	for i := 0; i < jobSize; i++ {
+		job := &PrintJob{
+			Index:    i,
+			Duration: time.Millisecond * 100,
 		}
-	}
 
-	for i := 0; i < work; i++ {
-		id := i
-		err = pool.Schedule(newFunc(id, time.Millisecond*100))
+		err = pool.Schedule(job)
 		if err != nil {
 			t.Log(err)
 			break
 		}
 	}
+
+	time.Sleep(time.Second * 1)
 }
 
-// go test -timeout 30s -v -run ^TestCancel$
-func TestCancel(t *testing.T) {
+// go test -timeout 5s -v -run ^TestStop$
+func TestStop(t *testing.T) {
 	const workers = 2
-	const work = 10
+	const jobSize = 10
 
 	pool, err := New(workers, 1)
 	if err != nil {
 		t.Error(err.Error())
 	}
 
-	defer pool.Close()
-
-	newFunc := func(id int, d time.Duration) WorkFunc {
-		return func(ctx context.Context) {
-			select {
-			case <-ctx.Done():
-				t.Logf("[WORK] ID: %d canceled", id)
-				return
-			default:
-				t.Log("[WORK] ID: ", id)
-				time.Sleep(d)
-			}
-		}
-	}
+	defer pool.Stop()
 
 	tm := time.NewTimer(time.Second * 1)
 	go func() {
 		<-tm.C
-		pool.Close()
+		pool.Stop()
 	}()
 
-	for i := 0; i < work; i++ {
-		id := i
-		err := pool.Schedule(newFunc(id, time.Second*1))
+	for i := 0; i < jobSize; i++ {
+		job := &PrintJob{
+			Index:    i,
+			Duration: time.Millisecond * 500,
+		}
+		err := pool.Schedule(job)
 		if err != nil {
 			t.Log(err)
 			break
@@ -76,7 +66,18 @@ func TestCancel(t *testing.T) {
 	}
 }
 
-// go test -timeout 30s -v -run ^TestReset$
-func TestReset(t *testing.T) {
-	//TODO
+type PrintJob struct {
+	Index    int
+	Duration time.Duration
+}
+
+func (p *PrintJob) Start(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		log.Printf("[JOB] ID %d - stop \n", p.Index)
+		return
+	default:
+		log.Printf("[JOB] ID %d \n", p.Index)
+		time.Sleep(p.Duration)
+	}
 }
