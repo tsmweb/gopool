@@ -8,8 +8,6 @@ package gopool
 import (
 	"context"
 	"errors"
-	"fmt"
-	"log"
 	"sync"
 )
 
@@ -97,7 +95,6 @@ func (p *Pool) Stop() {
 	p.mu.Lock()
 
 	if !p.stopped {
-		log.Println("[POOL] pool->Stop()")
 		close(p.close) // signal to shutdown workers and close the pool.
 		p.cancelFunc() // tells an operation to abandon its work.
 		p.stopped = true
@@ -120,7 +117,6 @@ func (p *Pool) worker(job Job) {
 
 	go func() {
 		defer func() {
-			fmt.Println("[POOL] worker done")
 			<-p.sema
 			p.wg.Done()
 		}()
