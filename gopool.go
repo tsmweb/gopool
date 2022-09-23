@@ -1,139 +1,129 @@
 /*
-Package gopool contains tools for goroutine reuse.
+Package gopool contains tools for reusing goroutine and for
+limiting resource consumption when running a collection of tasks.
 
+Executor example:
+
+	workerSize := 10
+	queueSize := 1
+
+	pool := gopool.New(workerSize, queueSize)
+	defer pool.Shutdown()
+
+	for i := 0; i < 100; i++ {
+		idx := i
+		err := pool.Schedule(func(ctx context.Context) {
+			select {
+			case <-ctx.Done():
+				log.Printf("[TASK] ID %d - stop \n", idx)
+				return
+			default:
+				log.Printf("[TASK] ID %d \n", idx)
+				time.Sleep(time.Millisecond * 100)
+		})
+		if err != nil {
+			t.Log(err)
+			break
+		}
+	}
 */
-
 package gopool
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"sync"
+	"time"
 )
 
-// Job type executed on pool workers.
-type Job interface {
-	Start(ctx context.Context)
-}
+var (
+	ErrClosedPool      = fmt.Errorf("closed pool")
+	ErrScheduleTimeout = fmt.Errorf("schedule error: timed out")
+)
 
-// Pool contains logic of goroutine reuse.
+// Pool contains logic for goroutine reuse.
 type Pool struct {
-	size int
 	sema chan struct{}
+	work chan func(ctx context.Context)
 	wg   sync.WaitGroup
 
-	queueSize int
-	queue     chan Job
+	shutdown   chan struct{}
+	mu         sync.Mutex // guard terminated
+	terminated bool
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
-
-	close   chan struct{}
-	mu      sync.Mutex // guard stopped
-	stopped bool
 }
 
-// New returns an initialized goroutine pool.
-//
-// The size parameter determines the size of the pool.
-// The queueSize parameter determines the size of the job queue.
-func New(size, queueSize int) (*Pool, error) {
-	if size <= 0 {
-		return nil, errors.New("size must be greater than 0")
+// New creates new goroutine pool with given size. It also creates a work
+// queue of given size.
+func New(size, queue int) *Pool {
+	if size <= 0 && queue > 0 {
+		panic("dead configuration detected")
 	}
 
-	if queueSize <= 0 {
-		return nil, errors.New("queue size must be greater than 0")
-	}
-
-	p := &Pool{
-		size:      size,
-		queueSize: queueSize,
-	}
-	p.initialize()
-
-	return p, nil
-}
-
-func (p *Pool) initialize() {
 	ctx, cancelFunc := context.WithCancel(context.Background())
-	p.sema = make(chan struct{}, p.size)
-	p.queue = make(chan Job, p.queueSize)
-	p.close = make(chan struct{})
-	p.ctx = ctx
-	p.cancelFunc = cancelFunc
-	p.stopped = false
+	return &Pool{
+		sema:       make(chan struct{}, size),
+		work:       make(chan func(ctx context.Context), queue),
+		shutdown:   make(chan struct{}),
+		terminated: false,
+		ctx:        ctx,
+		cancelFunc: cancelFunc,
+	}
 }
 
-// Schedule schedules job to be executed over pool's workers.
-func (p *Pool) Schedule(job Job) error {
-	if p.IsStopped() {
-		return errors.New("pool stopped")
-	}
+// Schedule schedules task to be executed over pool's workers.
+// It returns ErrClosedPool when pool is closed.
+func (p *Pool) Schedule(task func(ctx context.Context)) error {
+	return p.schedule(task, nil)
+}
 
+// ScheduleTimeout schedules task to be executed over pool's workers.
+// It returns ErrClosedPool when pool is closed.
+// It returns ErrScheduleTimeout when no free workers met during given timeout.
+func (p *Pool) ScheduleTimeout(timeout time.Duration, task func(ctx context.Context)) error {
+	return p.schedule(task, time.After(timeout))
+}
+
+// Shutdown close the pool.
+func (p *Pool) Shutdown() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.terminated {
+		close(p.shutdown) // signal to shutdown workers and close the pool.
+		p.cancelFunc()    // tells an operation to abandon its work.
+		p.terminated = true
+		close(p.work)
+		p.wg.Wait()
+	}
+}
+
+func (p *Pool) schedule(task func(ctx context.Context), timeout <-chan time.Time) error {
 	select {
-	case p.queue <- job:
+	case <-p.shutdown:
+		return ErrClosedPool
+	case <-timeout:
+		return ErrScheduleTimeout
+	case p.work <- task:
 		return nil
 	case p.sema <- struct{}{}:
-		p.worker(job)
+		p.wg.Add(1)
+		go p.worker(task)
 		return nil
 	}
 }
 
-// IsStopped returns if the pool is stopped.
-func (p *Pool) IsStopped() bool {
-	select {
-	case <-p.close:
-		return true
-	default:
-		return false
-	}
-}
-
-// Stop stops the workers.
-func (p *Pool) Stop() {
-	p.mu.Lock()
-
-	if !p.stopped {
-		close(p.close) // signal to shutdown workers and close the pool.
-		p.cancelFunc() // tells an operation to abandon its work.
-		p.stopped = true
-
-		go func() {
-			p.wg.Wait()
-			close(p.queue) // close the queue channel.
-		}()
-
-		for job := range p.queue {
-			job.Start(p.ctx)
-		}
-	}
-
-	p.mu.Unlock()
-}
-
-func (p *Pool) worker(job Job) {
-	p.wg.Add(1)
-
-	go func() {
-		defer func() {
-			<-p.sema
-			p.wg.Done()
-		}()
-
-	loop:
-		for {
-			select {
-			case <-p.close:
-				return
-			case job, ok := <-p.queue:
-				if !ok {
-					break loop
-				}
-				job.Start(p.ctx)
-			}
-		}
+func (p *Pool) worker(task func(ctx context.Context)) {
+	defer func() {
+		<-p.sema
+		p.wg.Done()
 	}()
 
-	p.queue <- job
+	task(p.ctx)
+
+	for task := range p.work {
+		task(p.ctx)
+	}
 }
