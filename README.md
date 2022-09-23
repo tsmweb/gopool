@@ -9,16 +9,16 @@ package main
 
 import (
 	"context"
-    "log"
-    "time"
-    "github.com/tsmweb/gopool"
+	"log"
+	"time"
+	"github.com/tsmweb/gopool"
 )
 
 func main() {
 	workerSize := 10
 	queueSize := 1
-
-    pool := gopool.New(workerSize, queueSize)
+	
+	pool := gopool.New(workerSize, queueSize)
 	defer pool.Shutdown()
 
 	for i := 0; i < 100; i++ {
