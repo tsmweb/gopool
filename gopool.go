@@ -7,8 +7,8 @@ Executor example:
 	workerSize := 10
 	queueSize := 1
 
-	pool := gopool.New(workerSize, queueSize)
-	defer pool.Shutdown()
+	ctx, stop := context.WithCancel(context.Background())
+	pool := gopool.New(ctx, workerSize, queueSize)
 
 	for i := 0; i < 100; i++ {
 		idx := i
@@ -26,6 +26,10 @@ Executor example:
 			break
 		}
 	}
+
+	stop()
+	pool.Wait()
+	...
 */
 package gopool
 
@@ -43,34 +47,29 @@ var (
 
 // Pool contains logic for goroutine reuse.
 type Pool struct {
+	ctx  context.Context
 	sema chan struct{}
 	work chan func(ctx context.Context)
 	wg   sync.WaitGroup
-
-	shutdown   chan struct{}
-	mu         sync.Mutex // guard terminated
-	terminated bool
-
-	ctx        context.Context
-	cancelFunc context.CancelFunc
 }
 
 // New creates new goroutine pool with given size. It also creates a work
 // queue of given size.
-func New(size, queue int) *Pool {
+func New(ctx context.Context, size, queue int) *Pool {
 	if size <= 0 && queue > 0 {
 		panic("dead configuration detected")
 	}
 
-	ctx, cancelFunc := context.WithCancel(context.Background())
 	return &Pool{
-		sema:       make(chan struct{}, size),
-		work:       make(chan func(ctx context.Context), queue),
-		shutdown:   make(chan struct{}),
-		terminated: false,
-		ctx:        ctx,
-		cancelFunc: cancelFunc,
+		sema: make(chan struct{}, size),
+		work: make(chan func(ctx context.Context), queue),
+		ctx:  ctx,
 	}
+}
+
+// Wait until all workers are terminated.
+func (p *Pool) Wait() {
+	p.wg.Wait()
 }
 
 // Schedule schedules task to be executed over pool's workers.
@@ -86,23 +85,9 @@ func (p *Pool) ScheduleTimeout(timeout time.Duration, task func(ctx context.Cont
 	return p.schedule(task, time.After(timeout))
 }
 
-// Shutdown close the pool.
-func (p *Pool) Shutdown() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if !p.terminated {
-		close(p.shutdown) // signal to shutdown workers and close the pool.
-		p.cancelFunc()    // tells an operation to abandon its work.
-		p.terminated = true
-		close(p.work)
-		p.wg.Wait()
-	}
-}
-
 func (p *Pool) schedule(task func(ctx context.Context), timeout <-chan time.Time) error {
 	select {
-	case <-p.shutdown:
+	case <-p.ctx.Done():
 		return ErrClosedPool
 	case <-timeout:
 		return ErrScheduleTimeout
@@ -123,7 +108,12 @@ func (p *Pool) worker(task func(ctx context.Context)) {
 
 	task(p.ctx)
 
-	for task := range p.work {
-		task(p.ctx)
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case task := <-p.work:
+			task(p.ctx)
+		}
 	}
 }

@@ -18,8 +18,8 @@ func main() {
 	workerSize := 10
 	queueSize := 1
 	
-	pool := gopool.New(workerSize, queueSize)
-	defer pool.Shutdown()
+	ctx, stop := context.WithCancel(context.Background())
+	pool := gopool.New(ctx, workerSize, queueSize)
 
 	for i := 0; i < 100; i++ {
 		task := &PrintTask{
@@ -33,6 +33,9 @@ func main() {
 			break
 		}
 	}
+
+	stop()
+	pool.Wait()
 }
 
 type PrintTask struct {
