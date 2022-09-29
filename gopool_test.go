@@ -11,8 +11,8 @@ func TestPool_Schedule(t *testing.T) {
 	workerSize := 4
 	queueSize := 1
 
-	ctx, stop := context.WithCancel(context.Background())
-	pool := New(ctx, workerSize, queueSize)
+	pool := New(workerSize, queueSize)
+	defer pool.Close()
 
 	for i := 0; i < 100; i++ {
 		task := &PrintTask{
@@ -25,17 +25,14 @@ func TestPool_Schedule(t *testing.T) {
 			break
 		}
 	}
-
-	stop()
-	pool.Wait()
 }
 
 func TestPool_ScheduleTimeout(t *testing.T) {
 	workerSize := 4
 	queueSize := 1
 
-	ctx, stop := context.WithCancel(context.Background())
-	pool := New(ctx, workerSize, queueSize)
+	pool := New(workerSize, queueSize)
+	defer pool.Close()
 
 	for i := 0; i < 100; i++ {
 		task := &PrintTask{
@@ -58,9 +55,6 @@ func TestPool_ScheduleTimeout(t *testing.T) {
 			time.Sleep(delay)
 		}
 	}
-
-	stop()
-	pool.Wait()
 }
 
 type PrintTask struct {

@@ -7,8 +7,8 @@ Executor example:
 	workerSize := 10
 	queueSize := 1
 
-	ctx, stop := context.WithCancel(context.Background())
-	pool := gopool.New(ctx, workerSize, queueSize)
+	pool := gopool.New(workerSize, queueSize)
+	defer pool.Close()
 
 	for i := 0; i < 100; i++ {
 		idx := i
@@ -26,9 +26,6 @@ Executor example:
 			break
 		}
 	}
-
-	stop()
-	pool.Wait()
 	...
 */
 package gopool
@@ -47,29 +44,45 @@ var (
 
 // Pool contains logic for goroutine reuse.
 type Pool struct {
-	ctx  context.Context
 	sema chan struct{}
 	work chan func(ctx context.Context)
 	wg   sync.WaitGroup
+
+	ctx       context.Context
+	closeFunc context.CancelFunc
+	closed    bool
+	mu        sync.RWMutex // guard closed
 }
 
 // New creates new goroutine pool with given size. It also creates a work
 // queue of given size.
-func New(ctx context.Context, size, queue int) *Pool {
+func New(size, queue int) *Pool {
 	if size <= 0 && queue > 0 {
 		panic("dead configuration detected")
 	}
 
+	ctx, closeFunc := context.WithCancel(context.Background())
+
 	return &Pool{
-		sema: make(chan struct{}, size),
-		work: make(chan func(ctx context.Context), queue),
-		ctx:  ctx,
+		sema:      make(chan struct{}, size),
+		work:      make(chan func(ctx context.Context), queue),
+		ctx:       ctx,
+		closeFunc: closeFunc,
+		closed:    false,
 	}
 }
 
-// Wait until all workers are terminated.
-func (p *Pool) Wait() {
-	p.wg.Wait()
+// Close closes workers and waits until all jobs are completed.
+func (p *Pool) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.closed {
+		p.closeFunc() // tells an operation to abandon its work.
+		p.closed = true
+		close(p.work)
+		p.wg.Wait()
+	}
 }
 
 // Schedule schedules task to be executed over pool's workers.
@@ -86,9 +99,14 @@ func (p *Pool) ScheduleTimeout(timeout time.Duration, task func(ctx context.Cont
 }
 
 func (p *Pool) schedule(task func(ctx context.Context), timeout <-chan time.Time) error {
-	select {
-	case <-p.ctx.Done():
+	p.mu.RLock()
+	if p.closed {
+		p.mu.RUnlock()
 		return ErrClosedPool
+	}
+	p.mu.RUnlock()
+
+	select {
 	case <-timeout:
 		return ErrScheduleTimeout
 	case p.work <- task:
@@ -108,12 +126,7 @@ func (p *Pool) worker(task func(ctx context.Context)) {
 
 	task(p.ctx)
 
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
-		case task := <-p.work:
-			task(p.ctx)
-		}
+	for task := range p.work {
+		task(p.ctx)
 	}
 }

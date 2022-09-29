@@ -8,7 +8,6 @@ The gopool package contains tools to reuse goroutine and limit resource consumpt
 package main
 
 import (
-	"context"
 	"log"
 	"time"
 	"github.com/tsmweb/gopool"
@@ -18,8 +17,8 @@ func main() {
 	workerSize := 10
 	queueSize := 1
 	
-	ctx, stop := context.WithCancel(context.Background())
-	pool := gopool.New(ctx, workerSize, queueSize)
+	pool := gopool.New(workerSize, queueSize)
+	defer pool.Close()
 
 	for i := 0; i < 100; i++ {
 		task := &PrintTask{
@@ -33,9 +32,6 @@ func main() {
 			break
 		}
 	}
-
-	stop()
-	pool.Wait()
 }
 
 type PrintTask struct {
